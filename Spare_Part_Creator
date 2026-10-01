@@ -1,0 +1,1583 @@
+"""
+SAP Spare Part Creator (MM01) - HTB3 / Plant 0230            version 2
+=======================================================================
+
+Built from:
+  * Manual_SP_creation_in_SAP_V4.docx   (what has to be filled)
+  * the SAP GUI script recording (VBS)  (the exact screen-field IDs of your system)
+
+What it does per Excel row
+  0. Opens SAP Logon, connects to the system and logs on - only if SAP is not
+     already open (with SSO nothing has to be typed).
+  1. MM01 main record: Basic data 1 (+ DE/KO/ZH descriptions), Basic data 2,
+     Classification, Purchasing, Foreign trade import, Purchase order text
+     (EN + DE), MRP 1-4, Forecasting, Plant data/stor. 1-2, Warehouse mgmt 1-2,
+     Accounting 1-2, Costing 1-2  ->  save  ->  new material number
+  2. MM01 valuation type NEW (Accounting 1)
+  3. MM01 valuation type UNV (Accounting 1)
+  4. Writes the material number + status back into the Excel file.
+
+Every field is first addressed with the ID from your recording
+(e.g. wnd[0]/usr/tabsTABSPR1/tabpSP09/.../ctxtMARC-EKGRP). If SAP shows a
+screen slightly differently, the script falls back to finding the field by its
+technical name (MARC-EKGRP) or its label ("Purchasing Group").
+
+Requirements (Windows PC with SAP GUI):
+    pip install pywin32 openpyxl
+    SAP GUI scripting enabled (you already recorded a script, so it is).
+
+Usage:
+    python sap_spare_part_creator.py SP_input_template.xlsx --validate
+    python sap_spare_part_creator.py SP_input_template.xlsx --dry-run --rows 3
+    python sap_spare_part_creator.py SP_input_template.xlsx --confirm
+    python sap_spare_part_creator.py SP_input_template.xlsx
+    python sap_spare_part_creator.py --inspect        (dump current SAP screen)
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import getpass
+import logging
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+try:
+    import openpyxl
+    from openpyxl.styles import PatternFill
+except ImportError:  # pragma: no cover
+    sys.exit("openpyxl is missing:  pip install openpyxl")
+
+log = logging.getLogger("sap_sp")
+OK = "OK"
+
+# ==========================================================================
+# 1. IDs taken from your SAP GUI recording
+# ==========================================================================
+TABS = "wnd[0]/usr/tabsTABSPR1/tabp"
+
+ID = {
+    "okcode": "wnd[0]/tbar[0]/okcd",
+    "save": "wnd[0]/tbar[0]/btn[11]",
+    "statusbar": "wnd[0]/sbar",
+    # initial screen
+    "matnr": "wnd[0]/usr/ctxtRMMG1-MATNR",
+    "industry": "wnd[0]/usr/cmbRMMG1-MBRSH",
+    "mat_type": "wnd[0]/usr/cmbRMMG1-MTART",
+    # view selection / org levels popup
+    "view_table": "wnd[1]/usr/tblSAPLMGMMTC_VIEW",
+    "view_deselect_all": "wnd[1]/tbar[0]/btn[19]",
+    "popup_ok": "wnd[1]/tbar[0]/btn[0]",
+    # Basic data 1 -> Additional data -> descriptions
+    "btn_additional_data": "wnd[0]/tbar[1]/btn[30]",
+    "btn_main_data": "wnd[0]/tbar[1]/btn[27]",
+    "desc_table": TABS + "ZU01/ssubTABFRA1:SAPLMGMM:2110/subSUB2:SAPLMGD1:8000/tblSAPLMGD1TC_KTXT",
+    # Classification
+    "class_table": "wnd[0]/usr/subSUBSCR_ZUORD:SAPLCLFM:1500/tblSAPLCLFMTC_OBJ_CLASS",
+    "char_table": ("wnd[0]/usr/subSUBSCR_BEWERT:SAPLCTMS:5000/tabsTABSTRIP_CHAR/tabpTAB1/"
+                   "ssubTABSTRIP_CHAR_GR:SAPLCTMS:5100/tblSAPLCTMSCHARS_S"),
+    "btn_next_screen": "wnd[0]/tbar[1]/btn[8]",
+    # Purchase order text
+    "po_editor": TABS + "SP11/ssubTABFRA1:SAPLMGMM:2010/subSUB2:SAPLMGD1:2321/cntlLONGTEXT_BESTELL/shellcont/shell",
+    "po_new_lang_btn": TABS + "SP11/ssubTABFRA1:SAPLMGMM:2010/subSUB2:SAPLMGD1:2321/btnTEAN",
+    "po_lang_new": "wnd[1]/usr/cmbDESC_LANGU_NEW",
+    "po_lang_copy_from": "wnd[1]/usr/cmbDESC_LANGU_NEW_VORLAGE",
+    # save popup "Last data screen reached"
+    "save_yes": "wnd[1]/usr/btnSPOP-OPTION1",
+    "save_cancel": "wnd[1]/usr/btnSPOP-OPTION_CAN",
+    # logon screen (standard SAP)
+    "logon_client": "wnd[0]/usr/txtRSYST-MANDT",
+    "logon_user": "wnd[0]/usr/txtRSYST-BNAME",
+    "logon_password": "wnd[0]/usr/pwdRSYST-BCODE",
+    "logon_language": "wnd[0]/usr/txtRSYST-LANGU",
+    "multi_logon_continue": "wnd[1]/usr/radMULTI_LOGON_OPT2",
+}
+
+# Fields per tab, exactly as recorded:  tab -> [(value key, ID below tabp<tab>/)]
+_M2000 = "ssubTABFRA1:SAPLMGMM:2000/"
+RECORDED_FIELDS: dict[str, list[tuple[str, str]]] = {
+    "SP01": [  # Basic data 1
+        ("desc_en", "ssubTABFRA1:SAPLMGMM:2004/subSUB1:SAPLMGD1:1002/txtMAKT-MAKTX"),
+        ("base_uom", "ssubTABFRA1:SAPLMGMM:2004/subSUB2:SAPLMGD1:2001/ctxtMARA-MEINS"),
+        ("material_group", "ssubTABFRA1:SAPLMGMM:2004/subSUB2:SAPLMGD1:2001/ctxtMARA-MATKL"),
+        ("division", "ssubTABFRA1:SAPLMGMM:2004/subSUB2:SAPLMGD1:2001/ctxtMARA-SPART"),
+        ("xplant_status", "ssubTABFRA1:SAPLMGMM:2004/subSUB2:SAPLMGD1:2001/ctxtMARA-MSTAE"),
+        ("valid_from", "ssubTABFRA1:SAPLMGMM:2004/subSUB2:SAPLMGD1:2001/ctxtMARA-MSTDE"),
+    ],
+    "SP09": [  # Purchasing
+        ("batch_managed", _M2000 + "subSUB2:SAPLMGD1:2301/chkMARA-XCHPF"),
+        ("purchasing_group", _M2000 + "subSUB2:SAPLMGD1:2301/ctxtMARC-EKGRP"),
+        ("plant_status", _M2000 + "subSUB2:SAPLMGD1:2301/ctxtMARC-MMSTA"),
+        ("valid_from", _M2000 + "subSUB2:SAPLMGD1:2301/ctxtMARC-MMSTD"),
+        ("purch_value_key", _M2000 + "subSUB3:SAPLMGD1:2302/ctxtMARA-EKWSL"),
+        ("mfr_part_no", _M2000 + "subSUB4:SAPLMGD1:2313/txtMARA-MFRPN"),
+        ("manufacturer_no", _M2000 + "subSUB4:SAPLMGD1:2313/ctxtMARA-MFRNR"),
+    ],
+    "SP10": [  # Foreign trade: import
+        ("country_origin", _M2000 + "subSUB3:SAPLMGD1:2207/ctxtMARC-HERKL"),
+    ],
+    "SP12": [  # MRP 1
+        ("reorder_point", _M2000 + "subSUB3:SAPLMGD1:2482/txtMARC-MINBE"),
+        ("mrp_controller", _M2000 + "subSUB3:SAPLMGD1:2482/ctxtMARC-DISPO"),
+    ],
+    "SP13": [  # MRP 2
+        ("prod_stor_loc", _M2000 + "subSUB2:SAPLMGD1:2484/ctxtMARC-LGPRO"),
+        ("ep_stor_loc", _M2000 + "subSUB2:SAPLMGD1:2484/ctxtMARC-LGFSB"),
+        ("planned_deliv_time", _M2000 + "subSUB3:SAPLMGD1:2485/txtMARC-PLIFZ"),
+    ],
+    "SP14": [  # MRP 3
+        ("availability_check", _M2000 + "subSUB4:SAPLMGD1:2493/ctxtMARC-MTVFP"),
+    ],
+    "SP20": [  # Plant data / stor. 2
+        ("profit_center", _M2000 + "subSUB3:SAPLMGD1:5801/ctxtMARC-PRCTR"),
+    ],
+    "SP21": [  # Warehouse management 1
+        ("stock_removal", _M2000 + "subSUB3:SAPLMGD1:2733/ctxtMLGN-LTKZA"),
+        ("stock_placement", _M2000 + "subSUB3:SAPLMGD1:2733/ctxtMLGN-LTKZE"),
+        ("storage_section_ind", _M2000 + "subSUB3:SAPLMGD1:2733/ctxtMLGN-LGBKZ"),
+    ],
+    "SP24": [  # Accounting 1 (also used for valuation types NEW / UNV)
+        ("valuation_category", _M2000 + "subSUB2:SAPLMGD1:2800/subSUB1:SAPLMGD1:2801/ctxtMBEW-BWTTY"),
+        ("valuation_class", _M2000 + "subSUB2:SAPLMGD1:2800/subSUB2:SAPLMGD1:2802/ctxtMBEW-BKLAS"),
+        ("price_control", _M2000 + "subSUB2:SAPLMGD1:2800/subSUB2:SAPLMGD1:2802/ctxtMBEW-VPRSV"),
+        ("moving_price", _M2000 + "subSUB2:SAPLMGD1:2800/subSUB2:SAPLMGD1:2802/txtMBEW-VERPR"),
+        ("standard_price", _M2000 + "subSUB2:SAPLMGD1:2800/subSUB2:SAPLMGD1:2802/txtMBEW-STPRS"),
+    ],
+    "SP26": [  # Costing 1
+        ("do_not_cost", _M2000 + "subSUB2:SAPLMGD1:2904/chkMARC-NCOST"),
+        ("material_origin", _M2000 + "subSUB2:SAPLMGD1:2904/chkMBEW-HKMAT"),
+        ("origin_group", _M2000 + "subSUB2:SAPLMGD1:2904/ctxtMBEW-HRKFT"),
+    ],
+}
+
+
+# ==========================================================================
+# 2. Fallback field map (technical name, then label EN/DE)
+#    Covers fields the recording did not touch because SAP pre-filled them
+#    (MRP type, lot size, stock det. group, forecast periods, ...) and any
+#    field whose ID differs on a given screen.
+# ==========================================================================
+@dataclass
+class FieldSpec:
+    key: str
+    names: list[str]
+    labels: list[str] = field(default_factory=list)
+    kind: str = "text"  # text | check | combo
+
+
+MAIN_FIELDS = [
+    FieldSpec("desc_en", ["MAKT-MAKTX"]),
+    FieldSpec("base_uom", ["MARA-MEINS"], ["Base Unit of Measure", "Basismengeneinheit"]),
+    FieldSpec("material_group", ["MARA-MATKL"], ["Material Group", "Warengruppe"]),
+    FieldSpec("division", ["MARA-SPART"], ["Division", "Sparte"]),
+    FieldSpec("xplant_status", ["MARA-MSTAE"], ["X-plant matl status"]),
+    FieldSpec("valid_from", ["MARA-MSTDE"]),
+    FieldSpec("item_cat_group", ["MARA-MTPOS_MARA"], ["GenItemCatGroup"]),
+    FieldSpec("purchasing_group", ["MARC-EKGRP"], ["Purchasing Group", "Einkäufergruppe"]),
+    FieldSpec("plant_status", ["MARC-MMSTA"], ["Plant-sp.matl status"]),
+    FieldSpec("valid_from", ["MARC-MMSTD"]),
+    FieldSpec("batch_managed", ["MARA-XCHPF", "MARC-XCHPF"], ["Batch management", "Chargenpflicht"], "check"),
+    FieldSpec("purch_value_key", ["MARA-EKWSL"], ["Purchasing value key"]),
+    FieldSpec("mfr_part_no", ["MARA-MFRPN"], ["Mfr Part Number", "Herstellerteilenr."]),
+    FieldSpec("manufacturer_no", ["MARA-MFRNR"], ["Manufact.", "Hersteller"]),
+    FieldSpec("comm_code", ["MARC-STAWN"], ["Comm./imp. code no.", "Warennummer"]),
+    FieldSpec("country_origin", ["MARC-HERKL"], ["Country of origin", "Ursprungsland"]),
+    FieldSpec("military", [], ["Military goods", "Kriegswaffe", "Militärgut"], "check"),
+    FieldSpec("mrp_type", ["MARC-DISMM"], ["MRP Type", "Dispositionsmerkmal"]),
+    FieldSpec("reorder_point", ["MARC-MINBE"], ["Reorder Point", "Meldebestand"]),
+    FieldSpec("mrp_controller", ["MARC-DISPO"], ["MRP Controller", "Disponent"]),
+    FieldSpec("lot_size", ["MARC-DISLS"], ["Lot sizing procedure", "Lot size", "Dispolosgröße"]),
+    FieldSpec("rounding_value", ["MARC-BSTRF"], ["Rounding value", "Rundungswert"]),
+    FieldSpec("special_procurement", ["MARC-SOBSL"], ["Special procurement", "Sonderbeschaffung"]),
+    FieldSpec("prod_stor_loc", ["MARC-LGPRO"], ["Prod. stor. location"]),
+    FieldSpec("ep_stor_loc", ["MARC-LGFSB"], ["Storage loc. for EP"]),
+    FieldSpec("stock_det_grp", ["MARC-EPRIO"], ["Stock det. grp"]),
+    FieldSpec("planned_deliv_time", ["MARC-PLIFZ"], ["Planned Deliv. Time", "Planlieferzeit"]),
+    FieldSpec("availability_check", ["MARC-MTVFP"], ["Availability check"]),
+    FieldSpec("hist_periods", ["MPOP-PERAN"], ["Hist. periods"]),
+    FieldSpec("forecast_periods", ["MPOP-ANZPR"], ["Forecast periods"]),
+    FieldSpec("profit_center", ["MARC-PRCTR"], ["Profit Center", "Profitcenter"]),
+    FieldSpec("stock_removal", ["MLGN-LTKZA"], ["Stock removal", "Auslagerung"]),
+    FieldSpec("stock_placement", ["MLGN-LTKZE"], ["Stock placement", "Einlagerung"]),
+    FieldSpec("storage_section_ind", ["MLGN-LGBKZ"], ["Storage Section Ind."]),
+    FieldSpec("valuation_category", ["MBEW-BWTTY"], ["Valuation Category", "Bewertungstyp"]),
+    FieldSpec("valuation_class", ["MBEW-BKLAS"], ["Valuation Class", "Bewertungsklasse"]),
+    FieldSpec("price_control", ["MBEW-VPRSV"], ["Price control", "Preissteuerung"]),
+    FieldSpec("moving_price", ["MBEW-VERPR"], ["Moving price", "Gleitender Preis"]),
+    FieldSpec("standard_price", ["MBEW-STPRS"], ["Standard price", "Standardpreis"]),
+    FieldSpec("do_not_cost", ["MARC-NCOST"], ["Do Not Cost", "Ohne Kalkulation"], "check"),
+    FieldSpec("origin_group", ["MBEW-HRKFT"], ["Origin Group", "Herkunftsgruppe"]),
+    FieldSpec("material_origin", ["MBEW-HKMAT"], ["Material origin"], "check"),
+]
+VALUATION_CLASS_SPEC = next(f for f in MAIN_FIELDS if f.key == "valuation_class")
+
+ORG_FIELDS = [
+    FieldSpec("plant", ["RMMG1-WERKS"], ["Plant", "Werk"]),
+    FieldSpec("storage_loc", ["RMMG1-LGORT"], ["Storage Loc.", "Lagerort"]),
+    FieldSpec("warehouse_no", ["RMMG1-LGNUM"], ["Warehouse No.", "Lagernummer"]),
+    FieldSpec("storage_type", ["RMMG1-LGTYP"], ["Storage Type", "Lagertyp"]),
+    FieldSpec("mrp_profile", ["RMMG1-DISPR"], ["MRP profile", "Dispoprofil"]),
+    FieldSpec("forecast_profile", ["RMMG1-PROPR"], ["Forecast prof.", "Prognoseprofil"]),
+    FieldSpec("val_type", ["RMMG1-BWTAR"], ["Valuation type", "Bewertungsart"]),
+]
+
+INPUT_TYPES = {"GuiTextField", "GuiCTextField", "GuiCheckBox", "GuiComboBox", "GuiRadioButton"}
+DESCEND_TYPES = {"GuiCustomControl", "GuiContainerShell", "GuiSimpleContainer", "GuiScrollContainer",
+                 "GuiUserArea", "GuiTabStrip", "GuiTab", "GuiSplitterContainer"}
+
+# ==========================================================================
+# 3. Excel layout
+# ==========================================================================
+PART_COLUMNS = [  # key, header, required
+    ("create", "Create (Y/N)", True),
+    ("desc_en", "Description EN (max 40)", True),
+    ("desc_de", "Description DE (max 40)", True),
+    ("base_uom", "Base UoM", True),
+    ("material_group", "Material group (36..)", True),
+    ("class_name", "Class (ECL_B_..)", True),
+    ("manufacturer_name", "Manufacturer name (text)", False),
+    ("mfr_part_no", "Mfr Part Number", True),
+    ("manufacturer_no", "Manufact. / supplier no. (SAP)", True),
+    ("comm_code", "Comm./imp. code no.", False),
+    ("country_origin", "Country of origin", True),
+    ("military", "Military good (Y/N)", False),
+    ("po_text_en", "PO text EN (blank = part no. + description)", False),
+    ("po_text_de", "PO text DE (blank = copy of EN)", False),
+    ("reorder_point", "Reorder point", True),
+    ("mrp_controller_row", "MRP controller (blank = default)", False),
+    ("consignment", "Consignment stock (Y/N)", False),
+    ("planned_deliv_time", "Planned deliv. time (days)", True),
+    ("part_category", "Part category (New part / Consumable)", True),
+    ("price", "Moving price", True),
+    ("purchasing_group_row", "Purchasing group (blank = default)", False),
+    ("extra_chars", "Extra characteristics (Descr=Value; ...)", False),
+    ("out_matnr", "SAP Material No", False),
+    ("out_main", "Main record", False),
+    ("out_new", "Val. type NEW", False),
+    ("out_unv", "Val. type UNV", False),
+    ("out_status", "Status", False),
+    ("out_message", "Message", False),
+    ("out_time", "Processed at", False),
+]
+OUTPUT_KEYS = {k for k, _, _ in PART_COLUMNS if k.startswith("out_")}
+INPUT_REQUIRED = [k for k, _, req in PART_COLUMNS if req and k not in OUTPUT_KEYS]
+
+
+class RowError(Exception):
+    """Stops the current row; the run continues with the next one."""
+
+
+class UserAbort(Exception):
+    pass
+
+
+# ==========================================================================
+# 4. Helpers
+# ==========================================================================
+def norm(s) -> str:
+    s = "" if s is None else str(s)
+    s = s.replace("\u00a0", " ").strip().lower().rstrip(":").strip()
+    return re.sub(r"\s+", " ", s)
+
+
+def cell_str(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if isinstance(v, (dt.date, dt.datetime)):
+        return v.strftime("%d.%m.%Y")
+    return str(v).strip()
+
+
+def yes(v) -> bool:
+    return norm(v) in {"y", "yes", "j", "ja", "x", "true", "1"}
+
+
+def to_float(v):
+    s = cell_str(v).replace(" ", "")
+    if not s:
+        return None
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    else:
+        s = s.replace(",", ".")
+    return float(s)
+
+
+def sap_num(v, dec_sep: str) -> str:
+    f = to_float(v)
+    if f is None:
+        return ""
+    s = str(int(f)) if f.is_integer() else f"{f:.3f}".rstrip("0").rstrip(".")
+    return s.replace(".", dec_sep)
+
+
+def label_match(label: str, targets: list[str]) -> bool:
+    nl = norm(label)
+    if not nl:
+        return False
+    for t in targets:
+        nt = norm(t)
+        if nl == nt or (len(nl) >= 6 and nt.startswith(nl.rstrip("."))):
+            return True
+    return False
+
+
+def part_category(v) -> str | None:
+    n = norm(v)
+    if n.startswith(("new", "neu")):
+        return "new"
+    if n.startswith(("cons", "verbr")):
+        return "consumable"
+    return None
+
+
+def kind_from_id(sid: str) -> str:
+    last = sid.rsplit("/", 1)[-1]
+    if last.startswith("chk"):
+        return "check"
+    if last.startswith("cmb"):
+        return "combo"
+    return "text"
+
+
+# ==========================================================================
+# 5. SAP GUI wrapper
+# ==========================================================================
+class Sap:
+    def __init__(self, session, pause: float = 0.0):
+        self.s = session
+        self.pause = pause
+
+    def find(self, sid: str):
+        try:
+            return self.s.findById(sid, False)
+        except Exception:
+            try:
+                return self.s.findById(sid)
+            except Exception:
+                return None
+
+    def has_popup(self, idx: int = 1) -> bool:
+        return self.find(f"wnd[{idx}]") is not None
+
+    def _settle(self):
+        if self.pause:
+            time.sleep(self.pause)
+        for _ in range(400):
+            try:
+                if not self.s.Busy:
+                    return
+            except Exception:
+                return
+            time.sleep(0.05)
+
+    def enter(self, wnd: int = 0):
+        self.find(f"wnd[{wnd}]").sendVKey(0)
+        self._settle()
+
+    def press(self, element):
+        element.press()
+        self._settle()
+
+    def press_id(self, sid: str) -> bool:
+        el = self.find(sid)
+        if el is None:
+            return False
+        self.press(el)
+        return True
+
+    def okcode(self, code: str):
+        self.find(ID["okcode"]).text = code
+        self.enter(0)
+
+    def status(self) -> tuple[str, str]:
+        for sid in ("wnd[1]/sbar", "wnd[0]/sbar"):
+            sb = self.find(sid)
+            if sb is None:
+                continue
+            try:
+                mtype, text = (sb.MessageType or ""), (sb.Text or "")
+            except Exception:
+                continue
+            if text or sid == "wnd[0]/sbar":
+                return mtype, text
+        return "", ""
+
+    # ---- discovery (fallback path) ----
+    def walk(self, root) -> list:
+        out = []
+        if root is None:
+            return out
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            try:
+                kids = node.Children
+                n = kids.Count
+            except Exception:
+                continue
+            for i in range(n):
+                try:
+                    k = kids.ElementAt(i)
+                    t = k.Type
+                except Exception:
+                    continue
+                out.append(k)
+                if t == "GuiTableControl":
+                    continue
+                try:
+                    is_cont = bool(k.ContainerType)
+                except Exception:
+                    is_cont = False
+                if is_cont or t in DESCEND_TYPES:
+                    stack.append(k)
+        return out
+
+    def screen_index(self, wnd: int = 0) -> "ScreenIndex":
+        return ScreenIndex(self.walk(self.find(f"wnd[{wnd}]/usr")))
+
+    def find_button(self, wnd: int, texts: list[str], areas=("tbar[1]", "tbar[0]", "usr")):
+        wanted = [norm(t) for t in texts]
+        for area in areas:
+            for el in self.walk(self.find(f"wnd[{wnd}]/{area}")):
+                try:
+                    if el.Type != "GuiButton":
+                        continue
+                    blob = norm(f"{el.Text} | {el.Tooltip}")
+                except Exception:
+                    continue
+                if any(w in blob for w in wanted):
+                    return el
+        return None
+
+    def table(self, recorded_id: str, wnd: int, cell_names: list[str]):
+        """Table by recorded ID, else first table containing all cell names."""
+        tbl = self.find(recorded_id) if recorded_id else None
+        if tbl is not None:
+            return tbl
+        for el in self.walk(self.find(f"wnd[{wnd}]/usr")):
+            if el.Type != "GuiTableControl":
+                continue
+            cols = self.table_columns(el)
+            if all(any(c.endswith(n) for c in cols) for n in cell_names):
+                return el
+        return None
+
+    @staticmethod
+    def table_columns(tbl) -> list[str]:
+        cols = []
+        try:
+            n = tbl.Columns.Count
+        except Exception:
+            return cols
+        for c in range(n):
+            try:
+                cols.append(tbl.GetCell(0, c).Name)
+            except Exception:
+                cols.append("")
+        return cols
+
+    def popup_text(self, idx: int = 1) -> str:
+        w = self.find(f"wnd[{idx}]")
+        parts = []
+        try:
+            parts.append(w.Text)
+        except Exception:
+            pass
+        for el in self.walk(self.find(f"wnd[{idx}]/usr")):
+            if el.Type in ("GuiLabel", "GuiTextField"):
+                try:
+                    if el.Text.strip():
+                        parts.append(el.Text.strip())
+                except Exception:
+                    pass
+        return " | ".join(parts)
+
+    def tab_id(self) -> str:
+        """Selected MM01 tab, e.g. 'SP09' (language independent)."""
+        ts = self.find("wnd[0]/usr/tabsTABSPR1")
+        if ts is None:
+            return ""
+        tab = None
+        try:
+            tab = ts.SelectedTab
+        except Exception:
+            try:
+                kids = ts.Children
+                for i in range(kids.Count):
+                    if kids.ElementAt(i).Children.Count > 0:
+                        tab = kids.ElementAt(i)
+                        break
+            except Exception:
+                pass
+        if tab is None:
+            return ""
+        m = re.search(r"tabp([^/]+)$", tab.Id)
+        return m.group(1) if m else tab.Name
+
+    def dump(self, out_file: Path):
+        lines = []
+        for idx in range(0, 4):
+            w = self.find(f"wnd[{idx}]")
+            if w is None:
+                continue
+            lines.append(f"===== wnd[{idx}]  title: {w.Text}")
+            for el in self.walk(w):
+                try:
+                    t, name, sid = el.Type, el.Name, el.Id
+                except Exception:
+                    continue
+                text = label = extra = ""
+                try:
+                    text = el.Text
+                except Exception:
+                    pass
+                try:
+                    label = el.LeftLabel.Text
+                except Exception:
+                    pass
+                if t == "GuiTableControl":
+                    extra = " columns=" + ",".join(self.table_columns(el))
+                elif t == "GuiButton":
+                    try:
+                        extra = f" tooltip={el.Tooltip!r}"
+                    except Exception:
+                        pass
+                sid = re.sub(r"^/app/con\[\d+\]/ses\[\d+\]/", "", sid)
+                lines.append(f"{t:18} name={name:28} label={label!r:30} text={text!r}{extra}\n"
+                             f"{'':18} id={sid}")
+        out_file.write_text("\n".join(lines), encoding="utf-8")
+        return out_file
+
+
+class ScreenIndex:
+    def __init__(self, elements: list):
+        self.by_name: dict[str, object] = {}
+        self.inputs, self.all = [], elements
+        for el in elements:
+            try:
+                if el.Type in INPUT_TYPES:
+                    self.inputs.append(el)
+                    self.by_name.setdefault(el.Name, el)
+            except Exception:
+                pass
+        self._labels = None
+
+    @staticmethod
+    def _label_of(el) -> str:
+        try:
+            if el.Type in ("GuiCheckBox", "GuiRadioButton"):
+                return el.Text
+            return el.LeftLabel.Text
+        except Exception:
+            return ""
+
+    def lookup(self, spec: FieldSpec):
+        for n in spec.names:
+            if n in self.by_name:
+                return self.by_name[n]
+        if not spec.labels:
+            return None
+        if self._labels is None:
+            self._labels = [(self._label_of(el), el) for el in self.inputs]
+        for lbl, el in self._labels:
+            if label_match(lbl, spec.labels):
+                if (spec.kind == "check") != (el.Type == "GuiCheckBox"):
+                    continue
+                return el
+        return None
+
+    def has(self, name: str) -> bool:
+        return name in self.by_name
+
+    def get(self, name: str):
+        return self.by_name.get(name)
+
+    def shells(self, subtype: str) -> list:
+        res = []
+        for el in self.all:
+            try:
+                if el.Type == "GuiShell" and el.SubType == subtype:
+                    res.append(el)
+            except Exception:
+                pass
+        return res
+
+
+def set_value(el, value, kind: str = "text") -> bool:
+    """Set a GUI element. Returns True if something changed."""
+    try:
+        if not el.Changeable:
+            return False
+    except Exception:
+        pass
+    t = el.Type
+    if t == "GuiCheckBox" or kind == "check":
+        want = value if isinstance(value, bool) else yes(value)
+        if bool(el.Selected) != want:
+            el.Selected = want
+            return True
+        return False
+    if t == "GuiComboBox":
+        target = norm(value)
+        try:
+            if norm(el.Key) == target:
+                return False
+        except Exception:
+            pass
+        entries = el.Entries
+        for i in range(entries.Count):
+            e = entries.ElementAt(i)
+            if norm(e.Key) == target or norm(e.Value) == target:
+                el.Key = e.Key
+                return True
+        raise RowError(f"Value '{value}' not found in dropdown '{el.Name}'")
+    value = "" if value is None else str(value)
+    if el.Text.strip().upper() != value.strip().upper():
+        el.Text = value
+        return True
+    return False
+
+
+# ==========================================================================
+# 6. Opening SAP / logging on
+# ==========================================================================
+def open_sap_session(d: dict, conn_idx: int = 0, ses_idx: int = 0):
+    """Attach to a running SAP GUI, or start SAP Logon, connect and log on."""
+    try:
+        import win32com.client
+    except ImportError:
+        sys.exit("pywin32 is missing:  pip install pywin32   (Windows only)")
+
+    def get_gui():
+        try:
+            return win32com.client.GetObject("SAPGUI")
+        except Exception:
+            return None
+
+    gui = get_gui()
+    if gui is None:
+        exe = d.get("sap_logon_path") or r"C:\Program Files (x86)\SAP\FrontEnd\SAPgui\saplogon.exe"
+        log.info("Starting SAP Logon: %s", exe)
+        try:
+            subprocess.Popen([exe])
+        except OSError as exc:
+            sys.exit(f"Cannot start SAP Logon ({exc}). Set 'sap_logon_path' in the Defaults sheet.")
+        for _ in range(60):
+            time.sleep(1)
+            gui = get_gui()
+            if gui is not None:
+                break
+        else:
+            sys.exit("SAP Logon did not start within 60 s")
+    app = gui.GetScriptingEngine
+
+    if app.Children.Count == 0:
+        system = d.get("sap_system")
+        if not system:
+            sys.exit("SAP is open but not connected. Enter the system name exactly as shown in "
+                     "SAP Logon into 'sap_system' (Defaults sheet), or log on manually first.")
+        log.info("Opening connection '%s'", system)
+        conn = app.OpenConnection(system, True)
+        time.sleep(2)
+    else:
+        conn = app.Children(conn_idx)
+    session = conn.Children(ses_idx)
+    sap = Sap(session)
+
+    # logon screen? (not needed with single sign-on)
+    if sap.find(ID["logon_user"]) is not None and sap.find(ID["logon_password"]) is not None:
+        if d.get("sap_client"):
+            sap.find(ID["logon_client"]).text = d["sap_client"]
+        if d.get("sap_user"):
+            sap.find(ID["logon_user"]).text = d["sap_user"]
+        if d.get("sap_language") and sap.find(ID["logon_language"]) is not None:
+            sap.find(ID["logon_language"]).text = d["sap_language"]
+        pwd = getpass.getpass(f"SAP password for {d.get('sap_user') or 'your user'} (not stored): ")
+        sap.find(ID["logon_password"]).text = pwd
+        sap.enter(0)
+        if sap.find(ID["multi_logon_continue"]) is not None:       # already logged on elsewhere
+            sap.find(ID["multi_logon_continue"]).select()
+            sap.enter(1)
+        mtype, text = sap.status()
+        if sap.find(ID["logon_password"]) is not None:
+            sys.exit(f"SAP logon failed: {text}")
+    try:
+        session.findById("wnd[0]").maximize()
+    except Exception:
+        pass
+    info = session.Info
+    log.info("Connected: system %s, client %s, user %s", info.SystemName, info.Client, info.User)
+    return session
+
+
+# ==========================================================================
+# 7. The MM01 procedure
+# ==========================================================================
+class SparePartCreator:
+    def __init__(self, sap: Sap, defaults: dict, charmap: list[tuple[str, str]],
+                 confirm: bool = False, dry_run: bool = False):
+        self.sap, self.d, self.charmap = sap, defaults, charmap
+        self.confirm, self.dry_run = confirm, dry_run
+        self.warnings: list[str] = []
+
+    # ---------- values ----------
+    def today(self) -> str:
+        fmt = self.d.get("date_format", "DD.MM.YYYY").upper()
+        return dt.date.today().strftime(fmt.replace("DD", "%d").replace("MM", "%m").replace("YYYY", "%Y"))
+
+    def main_values(self, r: dict) -> dict:
+        d, dec = self.d, self.d.get("decimal_separator", ",")
+        new = part_category(r["part_category"]) == "new"
+        return {
+            "desc_en": r["desc_en"],
+            "base_uom": r["base_uom"].upper(),
+            "material_group": r["material_group"],
+            "division": d["division"],
+            "xplant_status": d["xplant_status"],
+            "valid_from": self.today(),
+            "item_cat_group": d["item_cat_group"],
+            "purchasing_group": r.get("purchasing_group_row") or d["purchasing_group"],
+            "plant_status": d["plant_status"],
+            "batch_managed": yes(d["batch_managed"]),
+            "purch_value_key": d["purch_value_key"],
+            "mfr_part_no": r["mfr_part_no"],
+            "manufacturer_no": r["manufacturer_no"],
+            "comm_code": r.get("comm_code") or None,      # None = leave as SAP proposes
+            "country_origin": r["country_origin"].upper(),
+            "military": yes(r.get("military")),
+            "mrp_type": d["mrp_type"],
+            "reorder_point": sap_num(r["reorder_point"], dec),
+            "mrp_controller": r.get("mrp_controller_row") or d["mrp_controller"],
+            "lot_size": d["lot_size"],
+            "rounding_value": d["rounding_value"],
+            "special_procurement": d["consignment_special_proc"] if yes(r.get("consignment")) else "",
+            "prod_stor_loc": d["prod_stor_loc"],
+            "ep_stor_loc": d["ep_stor_loc"],
+            "stock_det_grp": d["stock_det_grp"],
+            "planned_deliv_time": sap_num(r["planned_deliv_time"], dec),
+            "availability_check": d["availability_check"],
+            "hist_periods": d["hist_periods"],
+            "forecast_periods": d["forecast_periods"],
+            "profit_center": d["profit_center"],
+            "stock_removal": d["stock_removal"],
+            "stock_placement": d["stock_placement"],
+            "storage_section_ind": d["storage_section_ind"],
+            "valuation_category": d["valuation_category"],
+            "valuation_class": d["val_class_new"] if new else d["val_class_consumable"],
+            "price_control": d["price_control"],
+            "moving_price": sap_num(r["price"], dec),
+            "do_not_cost": yes(d["do_not_cost"]),
+            "origin_group": d["origin_group"],
+            "material_origin": yes(d["material_origin"]),
+        }
+
+    def valuation_values(self, r: dict, which: str) -> dict:
+        d, dec = self.d, self.d.get("decimal_separator", ",")
+        new = part_category(r["part_category"]) == "new"
+        if which == "NEW":
+            return {"valuation_class": d["val_class_new"] if new else d["val_class_consumable"],
+                    "price_control": d["new_price_control"],
+                    "moving_price": sap_num(r["price"], dec)}
+        return {"valuation_class": d["unv_val_class_new"] if new else d["unv_val_class_consumable"],
+                "price_control": d["unv_price_control"],
+                "standard_price": sap_num(d["unv_standard_price"], dec)}
+
+    def po_text_en(self, r: dict) -> str:
+        if r.get("po_text_en"):
+            return r["po_text_en"]
+        tpl = self.d.get("po_text_en_template") or "{mfr_part_no}\\n{desc_en}"
+        try:
+            return tpl.replace("\\n", "\n").format(**r)
+        except (KeyError, IndexError, ValueError) as exc:
+            raise RowError(f"po_text_en_template in Defaults is invalid: {exc}")
+
+    # ---------- filling ----------
+    def fill_recorded(self, tab: str, values: dict) -> set:
+        """Fill the fields recorded for this tab. Returns keys that were handled."""
+        done = set()
+        for key, rel in RECORDED_FIELDS.get(tab, []):
+            if key not in values or values[key] is None:
+                continue
+            sid = f"{TABS}{tab}/{rel}"
+            el = self.sap.find(sid)
+            if el is None:
+                continue
+            try:
+                set_value(el, values[key], kind_from_id(sid))
+                done.add(key)
+            except RowError:
+                raise
+            except Exception as exc:
+                log.debug("recorded field %s: %s", key, exc)
+        return done
+
+    def fill_fallback(self, idx: ScreenIndex, specs: list[FieldSpec], values: dict, skip: set = frozenset()):
+        for spec in specs:
+            if spec.key in skip or spec.key not in values or values[spec.key] is None:
+                continue
+            el = idx.lookup(spec)
+            if el is None:
+                continue
+            try:
+                set_value(el, values[spec.key], spec.kind)
+            except RowError:
+                raise
+            except Exception as exc:
+                log.debug("could not set %s: %s", spec.key, exc)
+
+    def check_status(self, context: str, allow_warning: bool = False) -> str:
+        for _ in range(5):
+            mtype, text = self.sap.status()
+            if mtype in ("E", "A"):
+                raise RowError(f"{context}: SAP error: {text}")
+            if mtype == "W":
+                log.info("   warning (%s): %s", context, text)
+                self.warnings.append(text)
+                if not allow_warning:
+                    return text
+                self.sap.enter()
+                if self.sap.status() == (mtype, text):
+                    return text
+                continue
+            return text
+        return ""
+
+    def review_pause(self, what: str) -> bool:
+        print(f"\n>>> {what}: check the data in SAP now.")
+        ans = input("    [Enter] = save   s = skip this row   q = quit : ").strip().lower()
+        if ans == "q":
+            raise UserAbort()
+        return ans != "s"
+
+    # ---------- initial screen, views, org levels ----------
+    def start_mm01(self, matnr: str = ""):
+        self.sap.okcode("/nMM01")
+
+        m = self.sap.find(ID["matnr"])
+        if m is None:
+            raise RowError("MM01 initial screen not found")
+
+        # Existing material number (blank for new material)
+        m.text = matnr
+
+        industry = self.sap.find(ID["industry"])
+        material_type = self.sap.find(ID["mat_type"])
+
+        if industry is None:
+            raise RowError("Industry Sector field not found")
+
+        if material_type is None:
+            raise RowError("Material Type field not found")
+
+        try:
+            # Values taken directly from your successful SAP recording
+            industry.Key = "E"
+            material_type.Key = "ERSA"
+
+            log.info("MM01 initialized")
+            log.info("Industry Sector = E")
+            log.info("Material Type = ERSA")
+
+        except Exception as exc:
+            raise RowError(
+                f"Cannot set Industry Sector / Material Type: {exc}"
+        )
+
+        self.sap.enter()
+
+        mtype, text = self.sap.status()
+
+        if mtype in ("E", "A"):
+            raise RowError(f"MM01 initial screen error: {text}")
+
+    def open_views(self, views: list[str], org_values: dict):
+        self.sap.enter()                                   # as recorded: Enter opens "Select View(s)"
+        if not self.sap.has_popup(1):
+            self.check_status("initial screen")
+            btn = self.sap.find_button(0, ["Select View", "Sichtenauswahl"], areas=("tbar[1]",))
+            if btn is not None:
+                self.sap.press(btn)
+        if self.sap.find(ID["view_table"]) is not None or self.sap.has_popup(1):
+            self.set_views(views)
+            if not self.sap.press_id(ID["popup_ok"]):
+                self.sap.enter(1)
+        # org levels popup (only shown if not saved as default) / extra popups
+        for _ in range(5):
+            if self.sap.has_popup(2):                      # recorded: wnd[2].close
+                log.info("   closing popup: %s", self.sap.popup_text(2))
+                self.sap.find("wnd[2]").close()
+                self.sap._settle()
+                continue
+            if self.sap.has_popup(1):
+                idx = self.sap.screen_index(1)
+                if idx.has("RMMG1-WERKS") or idx.has("RMMG1-BWTAR"):
+                    self.fill_fallback(idx, ORG_FIELDS, org_values)
+                    self.sap.enter(1)
+                    if self.sap.has_popup(1) and self.sap.screen_index(1).has("RMMG1-WERKS") \
+                            and not self.sap.has_popup(2):
+                        raise RowError(f"Org. levels not accepted: {self.sap.status()[1]}")
+                    continue
+            break
+        self.check_status("org levels")
+
+    def set_views(self, views: list[str]):
+        wanted = {norm(v) for v in views}
+        self.sap.press_id(ID["view_deselect_all"])          # recorded: "deselect all" first
+        tbl = self.sap.table(ID["view_table"], 1, ["MSICHTAUSW-DYTXT"])
+        if tbl is None:
+            raise RowError("View selection table not found")
+        tid = tbl.Id
+        total, vis = tbl.RowCount, max(1, tbl.VisibleRowCount)
+        found, pos = set(), 0
+        while pos < total:
+            tbl = self.sap.find(tid)
+            try:
+                if tbl.VerticalScrollbar.Position != pos:
+                    tbl.VerticalScrollbar.Position = pos
+                    tbl = self.sap.find(tid)
+            except Exception:
+                pass
+            for i in range(vis):
+                absrow = pos + i
+                if absrow >= total:
+                    break
+                try:
+                    txt = norm(tbl.GetCell(i, 0).Text)
+                except Exception:
+                    continue
+                if not txt:
+                    continue
+                want = txt in wanted
+                row = tbl.GetAbsoluteRow(absrow)
+                if bool(row.Selected) != want:
+                    row.Selected = want
+                if want:
+                    found.add(txt)
+            pos += vis
+        missing = wanted - found
+        if missing:
+            raise RowError(f"Views not found in popup: {sorted(missing)} (check 'views_main' in Defaults)")
+
+    def verify_org_header(self, idx: ScreenIndex):
+        """Org-level popup is skipped when defaults are saved - check what SAP used."""
+        for name, key in (("RMMG1-WERKS", "plant"), ("RMMG1-LGNUM", "warehouse_no")):
+            el = idx.get(name)
+            if el is None:
+                continue
+            try:
+                shown = el.Text.strip()
+            except Exception:
+                continue
+            if shown and shown.lstrip("0") != self.d[key].lstrip("0"):
+                raise RowError(f"SAP uses {name}={shown}, expected {self.d[key]}. "
+                               "Fix the default org. levels in MM01 (or untick 'only on request').")
+
+    # ---------- Basic data 1 -> descriptions ----------
+    def maintain_descriptions(self, r: dict):
+        if not self.sap.press_id(ID["btn_additional_data"]):
+            btn = self.sap.find_button(0, ["Additional Data", "Zusatzdaten"], areas=("tbar[1]",))
+            if btn is None:
+                self.warnings.append("Additional Data button not found - DE/KO/ZH descriptions not set")
+                return
+            self.sap.press(btn)
+        self.check_status("basic data 1")
+        tbl = self.sap.table(ID["desc_table"], 0, ["SKTEXT-SPRAS", "SKTEXT-MAKTX"])
+        if tbl is None:
+            raise RowError("Description table (Additional Data) not found")
+        cols = self.sap.table_columns(tbl)
+        c_lang = next((i for i, c in enumerate(cols) if c.endswith("SPRAS")), 0)
+        c_text = next((i for i, c in enumerate(cols) if c.endswith("MAKTX")), 1)
+        wanted = [("DE", r["desc_de"])]
+        for lang in self.d.get("extra_desc_languages", "KO;ZH").split(";"):
+            if lang.strip():
+                wanted.append((lang.strip().upper(), r["desc_en"]))
+        existing, empty_rows = {}, []
+        for i in range(tbl.VisibleRowCount):
+            try:
+                lang = tbl.GetCell(i, c_lang).Text.strip().upper()
+            except Exception:
+                continue
+            if lang:
+                existing[lang] = i
+            else:
+                empty_rows.append(i)
+        for lang, text in wanted:
+            if lang in existing:
+                cell = tbl.GetCell(existing[lang], c_text)
+                if cell.Changeable and cell.Text.strip() != text:
+                    cell.Text = text
+                continue
+            if not empty_rows:
+                raise RowError("No free line in the description table")
+            i = empty_rows.pop(0)
+            tbl.GetCell(i, c_lang).Text = lang
+            tbl.GetCell(i, c_text).Text = text
+        self.sap.enter()
+        self.check_status("descriptions", allow_warning=True)
+        if not self.sap.press_id(ID["btn_main_data"]):
+            btn = self.sap.find_button(0, ["Main Data", "Hauptdaten"], areas=("tbar[1]",))
+            if btn is None:
+                raise RowError("'Main Data' button not found")
+            self.sap.press(btn)
+
+    # ---------- Classification ----------
+    def class_table(self):
+        return self.sap.table(ID["class_table"], 0, ["-CLASS"])
+
+    def handle_class_type_popup(self) -> bool:
+        for el in self.sap.walk(self.sap.find("wnd[1]/usr")):
+            try:
+                if el.Type in ("GuiLabel", "GuiTextField") and norm(el.Text) in ("material class", "materialklasse"):
+                    el.SetFocus()
+                    if not self.sap.press_id(ID["popup_ok"]):   # recorded: wnd[1]/tbar[0]/btn[0]
+                        self.sap.find("wnd[1]").sendVKey(2)
+                        self.sap._settle()
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def char_values(self, r: dict) -> dict[str, str]:
+        vals = {}
+        for descr, col_key in self.charmap:
+            if r.get(col_key):
+                vals[norm(descr)] = r[col_key]
+        for part in (r.get("extra_chars") or "").split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip() and v.strip():
+                    vals[norm(k)] = v.strip()
+        return vals
+
+    def fill_characteristics(self, r: dict) -> list[str]:
+        """Fill characteristic values. Returns mandatory (*) characteristics still empty."""
+        vals = self.char_values(r)
+        tbl = self.sap.table(ID["char_table"], 0, ["MWERT"])
+        if tbl is None:
+            self.warnings.append("Characteristic table not found - values not filled")
+            return []
+        tid = tbl.Id
+        cols = self.sap.table_columns(tbl)
+        c_val = next((i for i, c in enumerate(cols) if c.endswith("MWERT")), 3)  # recorded: column 3
+        c_names = [i for i, c in enumerate(cols) if i != c_val]
+        total, vis = tbl.RowCount, max(1, tbl.VisibleRowCount)
+        done, open_mandatory, pos = set(), [], 0
+        while pos < total:
+            tbl = self.sap.find(tid)
+            try:
+                if tbl.VerticalScrollbar.Position != pos:
+                    tbl.VerticalScrollbar.Position = pos
+                    tbl = self.sap.find(tid)
+            except Exception:
+                pass
+            for i in range(vis):
+                if pos + i >= total:
+                    break
+                names = []
+                for c in c_names:
+                    try:
+                        t = norm(tbl.GetCell(i, c).Text)
+                        if t:
+                            names.append(t)
+                    except Exception:
+                        pass
+                if not names:
+                    continue
+                key = next((k for k in vals for n in names
+                            if k == n or (len(n) >= 8 and (k.startswith(n) or n.startswith(k)))), None)
+                vcell = tbl.GetCell(i, c_val)
+                if key is not None and key not in done:
+                    if vcell.Changeable and not vcell.Text.strip():
+                        value = vals[key]
+                        maxlen = getattr(vcell, "MaxLength", 0) or 0
+                        if maxlen and len(value) > maxlen:
+                            self.warnings.append(f"'{key}' cut to {maxlen} chars")
+                            value = value[:maxlen]
+                        vcell.Text = value
+                    done.add(key)
+                elif any(n.endswith("*") for n in names) and not vcell.Text.strip():
+                    open_mandatory.append(names[0])
+            pos += vis
+        missing = set(vals) - done
+        if missing:
+            self.warnings.append(f"Characteristics not in this class: {sorted(missing)}")
+        return open_mandatory
+
+    def set_class_status(self, status: str):
+        tbl = self.class_table()
+        cols = self.sap.table_columns(tbl)
+        c_stat = next((i for i, c in enumerate(cols) if "STATU" in c), 3)       # recorded: column 3
+        tbl.GetCell(0, c_stat).Text = status
+
+    def do_classification(self, r: dict, state: dict):
+        tbl = self.class_table()
+        if state["class"] == 0:
+            cols = self.sap.table_columns(tbl)
+            c_class = next((i for i, c in enumerate(cols) if c.endswith("-CLASS")), 0)
+            cell = tbl.GetCell(0, c_class)
+            if cell.Text.strip().upper() != r["class_name"].upper():
+                cell.Text = r["class_name"]
+            self.sap.enter()
+            self.check_status("class assignment")
+            state["class"] = 1
+            return
+        if state["class"] == 1:
+            open_mand = self.fill_characteristics(r)
+            if open_mand:
+                st = self.d["class_status_fallback"]
+                self.set_class_status(st)
+                state["status_set"] = True
+                self.warnings.append(f"class status {st} (mandatory empty: {', '.join(open_mand)})")
+            state["class"] = 2
+        # recorded: wnd[0]/tbar[1]/btn[8] = next screen
+        if not self.sap.press_id(ID["btn_next_screen"]):
+            self.sap.enter()
+        mtype, text = self.sap.status()
+        if mtype in ("E", "A") and self.class_table() is not None:
+            if state.get("status_set"):
+                raise RowError(f"[Classification] {text}")
+            self.set_class_status(self.d["class_status_fallback"])
+            state["status_set"] = True
+            self.warnings.append(f"class status {self.d['class_status_fallback']}: {text}")
+            if not self.sap.press_id(ID["btn_next_screen"]):
+                self.sap.enter()
+            self.check_status("classification")
+        elif mtype == "W":
+            self.warnings.append(text)
+            self.sap.enter()
+
+    # ---------- Purchase order text ----------
+    def po_texts(self, r: dict, idx: ScreenIndex):
+        editor = self.sap.find(ID["po_editor"])
+        if editor is None:
+            eds = idx.shells("TextEdit")
+            if not eds:
+                self.warnings.append("PO text editor not found")
+                return
+            editor = eds[0]
+        editor.Text = self.po_text_en(r).replace("\n", "\r")
+        try:
+            btn = self.sap.find(ID["po_new_lang_btn"])           # recorded: btnTEAN
+            if btn is None:
+                for el in idx.all:
+                    try:
+                        if el.Type == "GuiButton" and (el.Name == "TEAN" or "create" in norm(el.Tooltip)):
+                            btn = el
+                            break
+                    except Exception:
+                        pass
+            if btn is None:
+                raise RuntimeError("'new language' button not found")
+            self.sap.press(btn)
+            new = self.sap.find(ID["po_lang_new"])
+            if new is None:
+                raise RuntimeError("Create Text popup did not open")
+            set_value(new, self.d.get("po_de_language_key", "D"), "combo")
+            copy_from = self.sap.find(ID["po_lang_copy_from"])
+            if copy_from is not None:                              # recorded: copy from EN
+                set_value(copy_from, self.d.get("po_copy_from_key", "E"), "combo")
+            if not self.sap.press_id(ID["popup_ok"]):
+                self.sap.enter(1)
+            if self.sap.has_popup(1):
+                txt = self.sap.popup_text(1)
+                self.sap.find("wnd[1]").sendVKey(12)
+                raise RuntimeError(txt)
+            if r.get("po_text_de"):
+                ed = self.sap.find(ID["po_editor"])
+                if ed is None:
+                    ed = self.sap.screen_index(0).shells("TextEdit")[0]
+                ed.Text = r["po_text_de"].replace("\n", "\r")
+        except Exception as exc:
+            self.warnings.append(f"German PO text not created ({exc}) - add it in MM02")
+
+    # ---------- step 1: main record ----------
+    def create_main(self, r: dict) -> str:
+        values = self.main_values(r)
+        self.start_mm01("")
+        self.open_views([v for v in self.d["views_main"].split(";") if v.strip()],
+                        {k: self.d[k] for k in ("plant", "storage_loc", "warehouse_no", "storage_type",
+                                                "mrp_profile", "forecast_profile")})
+        state = {"desc": False, "class": 0, "po": False}
+        last, same = None, 0
+        for _ in range(80):
+            # ---- popups ----
+            if self.sap.has_popup(1):
+                if self.sap.find(ID["save_yes"]) is not None:
+                    break                                      # "Last data screen reached - save?"
+                if self.handle_class_type_popup():
+                    continue
+                txt = self.sap.popup_text(1)
+                log.info("   popup: %s", txt)
+                self.warnings.append(f"popup: {txt}")
+                self.sap.enter(1)
+                if self.sap.has_popup(1) and self.sap.popup_text(1) == txt:
+                    raise RowError(f"Stuck on popup: {txt}")
+                continue
+
+            tab = self.sap.tab_id()
+
+            # ---- classification (own screen layout, no tab strip in the IDs) ----
+            if tab in ("", "SP03") and state["class"] < 3 and self.class_table() is not None:
+                before = state["class"]
+                self.do_classification(r, state)
+                if before == 2 or state["class"] == 2:
+                    if self.class_table() is None:
+                        state["class"] = 3
+                    else:
+                        same += 1
+                        if same > 3:
+                            raise RowError(f"Classification does not continue: {self.sap.status()[1]}")
+                continue
+
+            # ---- normal tabs: recorded IDs first, then fallback by name/label ----
+            handled = self.fill_recorded(tab, values)
+            idx = self.sap.screen_index(0)
+            self.fill_fallback(idx, MAIN_FIELDS, values, skip=handled)
+            self.verify_org_header(idx)
+
+            basic1 = tab == "SP01" or (idx.has("MARA-MEINS") and idx.has("MARA-MATKL") and idx.has("MARA-SPART"))
+            if basic1 and not state["desc"]:
+                self.maintain_descriptions(r)
+                state["desc"] = True
+                continue
+            if (tab == "SP11" or idx.shells("TextEdit")) and not state["po"]:
+                self.po_texts(r, idx)
+                state["po"] = True
+
+            self.sap.enter()
+            mtype, text = self.sap.status()
+            if mtype in ("E", "A"):
+                raise RowError(f"[{tab}] {text}")
+            if mtype == "W":
+                self.warnings.append(text)
+                self.sap.enter()                                # recorded: second Enter
+            now = self.sap.tab_id()
+            if now == tab == last and not self.sap.has_popup(1):
+                same += 1
+                if same >= 3:
+                    raise RowError(f"Screen {tab} does not advance: {self.sap.status()[1]}")
+            else:
+                same = 0
+            last = tab
+        else:
+            raise RowError("Too many screens - aborted")
+
+        # ---- save ----
+        if self.dry_run:
+            self._cancel_popup()
+            log.info("   DRY RUN - all screens filled, not saved")
+            self.sap.okcode("/nMM01")
+            return "DRYRUN"
+        if self.confirm:
+            self._cancel_popup()
+            if not self.review_pause("Main record ready"):
+                self.sap.okcode("/nMM01")
+                raise RowError("skipped by user before save")
+            self.sap.press_id(ID["save"])
+        else:
+            self.sap.press_id(ID["save_yes"])                   # recorded: SPOP-OPTION1
+        self._confirm_save_popups()
+        mtype, text = self.sap.status()
+        m = re.search(r"\b(\d{5,18})\b", text or "")
+        if mtype in ("E", "A") or not m:
+            raise RowError(f"Save failed / no material number in status bar: {text!r}")
+        return m.group(1)
+
+    def _cancel_popup(self):
+        if self.sap.press_id(ID["save_cancel"]) or self.sap.press_id("wnd[1]/tbar[0]/btn[12]"):
+            return
+        w = self.sap.find("wnd[1]")
+        if w is not None:
+            w.sendVKey(12)
+
+    def _confirm_save_popups(self):
+        for _ in range(3):
+            if not self.sap.has_popup(1):
+                return
+            if not self.sap.press_id(ID["save_yes"]):
+                self.sap.enter(1)
+
+    # ---------- steps 2/3: valuation types ----------
+    def create_valuation_type(self, r: dict, matnr: str, which: str):
+        val_type = self.d["new_val_type"] if which == "NEW" else self.d["unv_val_type"]
+        self.start_mm01(matnr)
+        try:
+            self.open_views([v for v in self.d["views_valuation"].split(";") if v.strip()],
+                            {"plant": self.d["plant"], "val_type": val_type})
+        except RowError as exc:
+            msg = norm(str(exc))
+            if ("already" in msg and "maintained" in msg) or ("bereits" in msg and "gepflegt" in msg):
+                log.info("   %s already exists in SAP - nothing to do", which)
+                self.sap.okcode("/nMM01")
+                return
+            raise
+        for _ in range(3):
+            if self.sap.has_popup(1) and self.sap.find(ID["save_yes"]) is None:
+                log.info("   popup: %s", self.sap.popup_text(1))
+                self.sap.enter(1)
+        values = self.valuation_values(r, which)
+        tab = self.sap.tab_id() or "SP24"
+        handled = self.fill_recorded(tab, values)
+        idx = self.sap.screen_index(0)
+        if "valuation_class" not in handled and idx.lookup(VALUATION_CLASS_SPEC) is None:
+            raise RowError(f"{which}: Accounting 1 not reached ({self.sap.status()[1]})")
+        self.fill_fallback(idx, MAIN_FIELDS, values, skip=handled)
+        self.sap.enter()
+        self.check_status(f"{which} accounting 1", allow_warning=True)   # UNV: recorded 2x Enter
+        if self.sap.find(ID["save_yes"]) is None and not self.sap.has_popup(1):
+            self.sap.enter()                                         # reach "last screen" popup
+            self.check_status(f"{which} accounting 1", allow_warning=True)
+        if self.dry_run:
+            self.sap.okcode("/nMM01")
+            return
+        if self.confirm:
+            self._cancel_popup()
+            if not self.review_pause(f"Valuation type {which} ready"):
+                self.sap.okcode("/nMM01")
+                raise RowError(f"{which} skipped by user before save")
+            self.sap.press_id(ID["save"])
+        elif not self.sap.press_id(ID["save_yes"]):
+            self.sap.press_id(ID["save"])
+        self._confirm_save_popups()
+        mtype, text = self.sap.status()
+        if mtype in ("E", "A"):
+            raise RowError(f"{which}: save failed: {text}")
+        log.info("   %s: %s", which, text)
+
+
+# ==========================================================================
+# 8. Excel I/O and validation
+# ==========================================================================
+class Workbook:
+    def __init__(self, path: Path):
+        self.path = path
+        self.wb = openpyxl.load_workbook(path)
+        self.ws = self.wb["Parts"]
+        header = [cell_str(c.value) for c in self.ws[1]]
+        self.col = {}
+        for key, head, _ in PART_COLUMNS:
+            if head not in header:
+                raise SystemExit(f"Column '{head}' missing in sheet 'Parts' - use the v2 template")
+            self.col[key] = header.index(head) + 1
+        self.defaults = {cell_str(r[0]): cell_str(r[1])
+                         for r in self.wb["Defaults"].iter_rows(min_row=2, values_only=True) if r and r[0]}
+        self.charmap = []
+        if "CharMap" in self.wb.sheetnames:
+            h2k = {norm(h): k for k, h, _ in PART_COLUMNS}
+            for row in self.wb["CharMap"].iter_rows(min_row=2, values_only=True):
+                if row and row[0] and row[1] and norm(row[1]) in h2k:
+                    self.charmap.append((cell_str(row[0]), h2k[norm(row[1])]))
+
+    def rows(self):
+        for rnum in range(2, self.ws.max_row + 1):
+            r = {k: cell_str(self.ws.cell(rnum, c).value) for k, c in self.col.items()}
+            if any(r[k] for k in r if k not in OUTPUT_KEYS):
+                yield rnum, r
+
+    def write(self, rnum: int, **vals):
+        fills = {OK: "C6EFCE", "ERROR": "FFC7CE", "DRYRUN": "FFEB9C", "PARTIAL": "FFEB9C"}
+        for k, v in vals.items():
+            c = self.ws.cell(rnum, self.col[k])
+            c.value = v
+            if k == "out_status" and v in fills:
+                c.fill = PatternFill("solid", fgColor=fills[v])
+
+    def save(self):
+        try:
+            self.wb.save(self.path)
+        except PermissionError:
+            alt = self.path.with_name(self.path.stem + "_results.xlsx")
+            self.wb.save(alt)
+            log.warning("Workbook is open in Excel - results written to %s", alt.name)
+
+
+REQUIRED_DEFAULTS = [
+    "industry_sector", "material_type", "plant", "storage_loc", "warehouse_no", "storage_type",
+    "mrp_profile", "forecast_profile", "division", "xplant_status", "item_cat_group",
+    "purchasing_group", "plant_status", "batch_managed", "purch_value_key", "mrp_type",
+    "mrp_controller", "lot_size", "rounding_value", "prod_stor_loc", "ep_stor_loc",
+    "stock_det_grp", "consignment_special_proc", "availability_check", "hist_periods",
+    "forecast_periods", "profit_center", "stock_removal", "stock_placement",
+    "storage_section_ind", "valuation_category", "price_control", "val_class_new",
+    "val_class_consumable", "do_not_cost", "origin_group", "material_origin", "new_val_type",
+    "new_price_control", "unv_val_type", "unv_price_control", "unv_val_class_new",
+    "unv_val_class_consumable", "unv_standard_price", "class_status_fallback",
+    "views_main", "views_valuation",
+]
+
+
+def validate_defaults(d: dict) -> list[str]:
+    return [f"Defaults sheet: '{k}' is missing/empty" for k in REQUIRED_DEFAULTS if not d.get(k)]
+
+
+def validate_row(r: dict) -> list[str]:
+    errs = []
+    for k in INPUT_REQUIRED:
+        if k != "create" and not r.get(k):
+            errs.append(f"'{next(h for kk, h, _ in PART_COLUMNS if kk == k)}' is empty")
+    for k in ("desc_en", "desc_de"):
+        if len(r.get(k, "")) > 40:
+            errs.append(f"{k} longer than 40 characters ({len(r[k])})")
+    if r.get("material_group") and not r["material_group"].startswith("36"):
+        errs.append("material group must start with 36")
+    if r.get("class_name") and not re.fullmatch(r"ECL_B_\w+", r["class_name"].upper()):
+        errs.append("class must look like ECL_B_12345678")
+    if r.get("part_category") and part_category(r["part_category"]) is None:
+        errs.append("part category must be 'New part' or 'Consumable'")
+    if r.get("country_origin") and not re.fullmatch(r"[A-Za-z]{2}", r["country_origin"]):
+        errs.append("country of origin must be a 2-letter code (DE, JP, CN ...)")
+    if r.get("comm_code") and not re.fullmatch(r"\d{6,11}", r["comm_code"].replace(" ", "")):
+        errs.append("comm./imp. code must be 6-11 digits")
+    for k, label in (("reorder_point", "reorder point"), ("price", "moving price"),
+                     ("planned_deliv_time", "planned delivery time")):
+        if r.get(k):
+            try:
+                if to_float(r[k]) < 0:
+                    errs.append(f"{label} must be >= 0")
+            except ValueError:
+                errs.append(f"{label} is not a number")
+    try:
+        if r.get("price") and to_float(r["price"]) == 0:
+            errs.append("moving price is 0")
+    except ValueError:
+        pass
+    for k in ("military", "consignment"):
+        if r.get(k) and norm(r[k]) not in {"y", "n", "yes", "no", "j", "ja", "nein", "x"}:
+            errs.append(f"{k} must be Y or N")
+    return errs
+
+
+# ==========================================================================
+# 9. Runner
+# ==========================================================================
+def connect_sap(defaults: dict, conn_idx: int, ses_idx: int):
+    return open_sap_session(defaults, conn_idx, ses_idx)
+
+
+def parse_rows(spec: str | None) -> set[int] | None:
+    if not spec:
+        return None
+    res = set()
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            res.update(range(int(a), int(b) + 1))
+        elif part.strip():
+            res.add(int(part))
+    return res
+
+
+def process(args):
+    wbook = Workbook(Path(args.excel))
+    errs = validate_defaults(wbook.defaults)
+    if errs:
+        for e in errs:
+            log.error(e)
+        sys.exit(1)
+    selected = parse_rows(args.rows)
+    todo = []
+    for rnum, r in wbook.rows():
+        if (selected and rnum not in selected) or not yes(r["create"]):
+            continue
+        if r["out_main"] == OK and r["out_new"] == OK and r["out_unv"] == OK:
+            log.info("Row %d already complete (%s) - skipped", rnum, r["out_matnr"])
+            continue
+        problems = validate_row(r)
+        if problems:
+            log.error("Row %d: %s", rnum, "; ".join(problems))
+            wbook.write(rnum, out_status="ERROR", out_message="Validation: " + "; ".join(problems))
+            continue
+        todo.append((rnum, r))
+    wbook.save()
+    log.info("%d row(s) ready for SAP", len(todo))
+    if args.validate or not todo:
+        return
+
+    sap = Sap(connect_sap(wbook.defaults, args.connection, args.session), pause=args.pause)
+    creator = SparePartCreator(sap, wbook.defaults, wbook.charmap, confirm=args.confirm, dry_run=args.dry_run)
+    ok_count = err_count = 0
+    for rnum, r in todo:
+        creator.warnings = []
+        log.info("Row %d: %s", rnum, r["desc_en"])
+        now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+        matnr = r["out_matnr"]
+        try:
+            if r["out_main"] != OK or not matnr:
+                result = creator.create_main(r)
+                if result == "DRYRUN":
+                    wbook.write(rnum, out_status="DRYRUN", out_time=now,
+                                out_message=" | ".join(["Dry run OK"] + creator.warnings)[:500])
+                    wbook.save()
+                    continue
+                matnr = result
+                wbook.write(rnum, out_matnr=matnr, out_main=OK, out_time=now)
+                wbook.save()
+                log.info("   material %s created", matnr)
+            for which, key in (("NEW", "out_new"), ("UNV", "out_unv")):
+                if r[key] != OK:
+                    creator.create_valuation_type(r, matnr, which)
+                    wbook.write(rnum, **{key: OK})
+                    wbook.save()
+            wbook.write(rnum, out_status=OK, out_time=now, out_message=" | ".join(creator.warnings)[:500])
+            ok_count += 1
+        except UserAbort:
+            log.info("Stopped by user")
+            wbook.save()
+            break
+        except Exception as exc:
+            err_count += 1
+            log.error("   row %d failed: %s", rnum, exc)
+            wbook.write(rnum, out_status="PARTIAL" if matnr else "ERROR", out_time=now,
+                        out_message=" | ".join([str(exc)] + creator.warnings)[:500])
+            wbook.save()
+            try:
+                sap.okcode("/nMM01")
+            except Exception:
+                pass
+            if args.stop_on_error:
+                break
+        wbook.save()
+    log.info("Finished: %d OK, %d with errors. Results in %s", ok_count, err_count, wbook.path.name)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Create HTB3 spare parts in SAP (MM01) from Excel")
+    ap.add_argument("excel", nargs="?", help="input workbook (SP_input_template.xlsx)")
+    ap.add_argument("--validate", action="store_true", help="only check the Excel, no SAP")
+    ap.add_argument("--dry-run", action="store_true", help="fill all screens but never save")
+    ap.add_argument("--confirm", action="store_true", help="pause for review before every save")
+    ap.add_argument("--rows", help="Excel row numbers, e.g. 5 or 5-9 or 5,7,12")
+    ap.add_argument("--stop-on-error", action="store_true")
+    ap.add_argument("--inspect", action="store_true", help="dump the current SAP screen to sap_screen_dump.txt")
+    ap.add_argument("--connection", type=int, default=0)
+    ap.add_argument("--session", type=int, default=0)
+    ap.add_argument("--pause", type=float, default=0.0, help="extra seconds after each SAP action")
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if args.excel:
+        handlers.append(logging.FileHandler(
+            Path(args.excel).with_name(f"sap_run_{dt.datetime.now():%Y%m%d_%H%M}.log"), encoding="utf-8"))
+    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S", handlers=handlers)
+    if args.inspect:
+        defaults = Workbook(Path(args.excel)).defaults if args.excel else {}
+        sap = Sap(connect_sap(defaults, args.connection, args.session))
+        print(f"Screen dump written to {sap.dump(Path('sap_screen_dump.txt')).resolve()}")
+        return
+    if not args.excel:
+        ap.error("excel file is required")
+    process(args)
+
+
+if __name__ == "__main__":
+    main()
